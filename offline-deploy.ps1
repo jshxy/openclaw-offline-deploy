@@ -40,7 +40,6 @@ if ($Registry -eq "official") {
     Write-Host "[WARNING] Invalid registry provided. Falling back to default mirror." -ForegroundColor Yellow
 }
 
-# 确保 URL 以斜杠结尾
 if (-not $ActualRegistry.EndsWith("/")) {
     $ActualRegistry += "/"
 }
@@ -77,24 +76,21 @@ if ($Action -eq "pack") {
     $nodeScript = "const fs=require('fs');fs.writeFileSync('.npmrc',['store-dir=./.pnpm-store-local','registry=$ActualRegistry','network-concurrency=$Concurrency','fetch-retries=$Retries','fetch-retry-mintimeout=$RetryTimeout'].join(String.fromCharCode(10)));let p=JSON.parse(fs.readFileSync('package.json','utf8'));p.pnpm=p.pnpm||{};p.pnpm.supportedArchitectures={os:['current','win32','linux','darwin'],cpu:['current','x64','arm64']};p.pnpm.onlyBuiltDependencies=['@google/genai','@matrix-org/matrix-sdk-crypto-nodejs','@tloncorp/tlon-skill','baileys','esbuild','koffi','protobufjs','sharp','tree-sitter-bash','@discordjs/opus','@tloncorp/api'];fs.writeFileSync('package.json',JSON.stringify(p,null,2));"
     node -e $nodeScript
 
-    Write-Info "Packing offline pnpm..."
-    corepack enable
-    corepack pack pnpm@$PnpmVersion
-    Assert-Success "Corepack Pack"
+    Write-Info "Packing offline pnpm using native npm..."
+    npm pack pnpm@$PnpmVersion
+    Assert-Success "npm pack pnpm"
     
-    if (Test-Path "corepack.tgz") {
-        Move-Item -Path "corepack.tgz" -Destination "pnpm-offline.tgz" -Force
-    } elseif (Test-Path "pnpm-$PnpmVersion.tgz") {
+    if (Test-Path "pnpm-$PnpmVersion.tgz") {
         Move-Item -Path "pnpm-$PnpmVersion.tgz" -Destination "pnpm-offline.tgz" -Force
     } else {
-        Write-Host "[ERROR] Corepack output file not found!" -ForegroundColor Red
+        Write-Host "[ERROR] npm pack output file not found!" -ForegroundColor Red
         exit 1
     }
 
     Write-Info "Downloading dependencies via configured registry..."
     $env:SHARP_IGNORE_GLOBAL_LIBVIPS = "1"
-    corepack pnpm@$PnpmVersion install
-    Assert-Success "pnpm install (Pack Phase)"
+    npx pnpm@$PnpmVersion install
+    Assert-Success "npx pnpm install (Pack Phase)"
 
     Write-Info "Creating zip archive..."
     Remove-Item -Recurse -Force "node_modules" -ErrorAction SilentlyContinue
@@ -106,24 +102,43 @@ if ($Action -eq "pack") {
 } elseif ($Action -eq "install") {
     Write-Info "Phase 2: Starting offline installation..."
 
-    if (Test-Path "openclaw-offline-windows.zip") {
-        Write-Info "Extracting zip file..."
-        if (Test-Path "openclaw") { Remove-Item -Recurse -Force "openclaw" }
-        Expand-Archive -Path "openclaw-offline-windows.zip" -DestinationPath "." -Force
+Write-Info "Phase 2: Starting offline installation..."
+
+    $SkipExtraction = $false
+    if (Test-Path "openclaw\package.json") {
+        Write-Info "Detected manually extracted 'openclaw' directory. Skipping zip extraction to save time."
         Set-Location "openclaw"
-    } elseif (Test-Path "openclaw") {
-        Set-Location "openclaw"
-    } elseif (Test-Path "pnpm-offline.tgz") {
-        Write-Info "Already in openclaw directory."
-    } else {
-        Write-Host "[ERROR] Cannot find zip file or openclaw directory!" -ForegroundColor Red
-        exit 1
+        $SkipExtraction = $true
+    } elseif (Test-Path "package.json") {
+        Write-Info "Already inside a valid openclaw directory. Proceeding..."
+        $SkipExtraction = $true
     }
 
-    Write-Info "Installing offline pnpm..."
-    corepack enable
-    corepack install -g ./pnpm-offline.tgz
-    Assert-Success "Corepack Install"
+    if (-not $SkipExtraction) {
+        if (Test-Path "openclaw-offline-windows.zip") {
+            Write-Info "Extracting zip file (This might take a while, consider extracting manually next time)..."
+            Expand-Archive -Path "openclaw-offline-windows.zip" -DestinationPath "." -Force
+            Set-Location "openclaw"
+        } else {
+            Write-Host "[ERROR] Cannot find 'openclaw-offline-windows.zip' or a valid 'openclaw' directory!" -ForegroundColor Red
+            exit 1
+        }
+    }
+
+    if (Test-Path "pnpm-offline.tgz") {
+        Write-Info "Installing offline pnpm globally using native npm..."
+        npm install -g ./pnpm-offline.tgz
+        Assert-Success "npm install local pnpm"
+    } else {
+        if (-not (Get-Command pnpm -ErrorAction SilentlyContinue)) {
+            Write-Host "[ERROR] 'pnpm-offline.tgz' not found and 'pnpm' is not available on this system!" -ForegroundColor Red
+            exit 1
+        }
+    }
+
+    Write-Info "Installing offline pnpm globally using native npm..."
+    npm install -g ./pnpm-offline.tgz
+    Assert-Success "npm install local pnpm"
 
     Write-Info "Installing dependencies offline..."
     $env:SHARP_IGNORE_GLOBAL_LIBVIPS = "1"
