@@ -19,7 +19,7 @@ Utilizes the Taobao mirror for more stable connections in some certain etwork en
 
 * **Cross-Platform Offline Deployment**: Automatically configures full deployment, ensuring all binary dependencies for Mac/Linux/Windows and x64/ARM architectures are fetched completely in one go.
 * **Smart Resume & Concurrency Control**: Built-in network exception blocking and parameterized retry mechanisms, optimized for network environments with concurrency limits.
-
+* **Architecture Targeting**: Filter target OS and CPU architectures (e.g., Windows x64 only) you need.
 ---
 
 ## ⚠️ Anti-Scam Warning
@@ -61,6 +61,7 @@ Before starting, please ensure your machines meet the following requirements:
 ### Phase 1: Build the Offline Package on the [Online Machine]
 
 1. Download the `openclaw-deploy.ps1` script from this repository and place it in any empty directory.
+
 2. Open PowerShell in that directory and run the following command to start packaging:
    ```powershell
    .\openclaw-deploy.ps1 -Action pack
@@ -75,19 +76,21 @@ Before starting, please ensure your machines meet the following requirements:
 ### Phase 2: Extract and Install on the [Offline Machine]
 
 1. Copy both the generated `openclaw-offline-windows.zip` and the `openclaw-deploy.ps1` script into the same directory on the offline machine.
+
 2. (Optional) If you want to keep things organized, it is recommended to move these two files to the permanent installation path for OpenClaw (e.g., `D:\Program Files\OpenClaw`).
+
 3. Open PowerShell in that directory and execute the offline installation command:
 ```powershell
 .\openclaw-deploy.ps1 -Action install
 ```
-
+*(Note: The script features smart detection. If you manually extract the zip file using a tool like 7-Zip to save time, the script will automatically detect the folder and skip extraction.)*
 
 4. The script will automatically extract, reassemble dependencies offline, build the backend and UI, and register the global command in Windows.
+
 5. Once you see the green `Install completed!`, **run the final startup command**:
 ```powershell
 openclaw onboard --install-daemon
 ```
-
 
 
 ---
@@ -110,6 +113,18 @@ The project uses Taobao mirror by default. You can choose not to use 3-rd-party 
 
 # Pack using a custom private registry with limited concurrency
 .\openclaw-deploy.ps1 -Action pack -Registry "[https://npm.custom.com/](https://npm.custom.com/)" -Concurrency 2
+```
+
+### Target Architecture (-TargetOS, -TargetCPU)
+
+By default, the script fetches binaries for all platforms. If you your target OS or architecture, you can filter out binaries you need:
+
+```PowerShell
+# Only fetch Windows x64 binary dependencies (Fastest)
+.\offline-deploy.ps1 -Action pack -TargetOS "win32" -TargetCPU "x64"
+
+# Fetch x64 dependencies for both Windows and Linux
+.\offline-deploy.ps1 -Action pack -TargetOS "win32,linux" -TargetCPU "x64"
 ```
 
  ### Network Parameter Tuning

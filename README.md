@@ -18,7 +18,7 @@
 
 * **跨平台离线部署**：自动配置全量部署，确保 Mac/Linux/Windows 和 x64/ARM 架构依赖的二进制包一次性全量抓取。
 * **智能断点续传与并发控制**：内置网络异常阻断与参数化重试机制，针对部分网络环境对并发的限制进行优化。
-
+* **支持交叉编译，可选目标架构**：支持按需过滤目标操作系统和 CPU 架构（如仅拉取 Windows x64），大幅减少不必要的二进制包下载时间与压缩包体积。
 ---
 
 ## ⚠️ 声明 (Anti-Scam Warning)
@@ -79,7 +79,7 @@
 ```powershell
 .\openclaw-deploy.ps1 -Action install
 ```
-
+*(注：脚本支持智能探针。如果你觉得 ZIP 解压太慢，可以提前手动右键用解压软件解压出 openclaw 文件夹，脚本会自动识别并跳过解压步骤。)*
 
 4. 脚本将自动解压、离线重组依赖、编译前后端 UI，并向 Windows 注册全局命令。
 5. 看到绿色的 `Install completed!` 后，**执行最后一步启动命令**：
@@ -107,6 +107,16 @@ openclaw onboard --install-daemon
 
 # 使用自定义私有源打包，并限制并发
 .\openclaw-deploy.ps1 -Action pack -Registry "[https://npm.custom.com/](https://npm.custom.com/)" -Concurrency 2
+```
+### 目标架构过滤 (-TargetOS, -TargetCPU)
+默认脚本会抓取全平台全架构。如果你确定只在目标机器系统及架构上运行，可以通过指定参数剔除不需要的二进制包，大幅缩减打包时间和体积：
+
+```PowerShell
+# 仅抓取 Windows x64 架构的底层依赖 (极速模式)
+.\offline-deploy.ps1 -Action pack -TargetOS "win32" -TargetCPU "x64"
+
+# 抓取 Windows 和 Linux 下的 x64 架构依赖
+.\offline-deploy.ps1 -Action pack -TargetOS "win32,linux" -TargetCPU "x64"
 ```
 
 ### 网络参数调节

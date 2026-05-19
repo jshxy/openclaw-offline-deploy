@@ -13,11 +13,17 @@ param (
     [int]$RetryTimeout = 2000,
 
     [Parameter(Mandatory=$false)]
-    [string]$Registry = "default"
+    [string]$Registry = "default",
+
+    [Parameter(Mandatory=$false)]
+    [string]$TargetOS = "current,win32,linux,darwin",
+
+    [Parameter(Mandatory=$false)]
+    [string]$TargetCPU = "current,x64,arm64"
 )
 
 $ErrorActionPreference = "Stop"
-$FallbackPnpmVersion = "10.23.0"
+$FallbackPnpmVersion = "11.1.0"
 $utf8NoBom = New-Object System.Text.UTF8Encoding $false
 
 function Write-Info([string]$Message) {
@@ -36,13 +42,14 @@ if ($Registry -eq "official") {
     $ActualRegistry = "https://registry.npmjs.org/"
 } elseif ($Registry -match "^https?://") {
     $ActualRegistry = $Registry
-} elseif ($Registry -ne "default") {
-    Write-Host "[WARNING] Invalid registry provided. Falling back to default mirror." -ForegroundColor Yellow
 }
 
 if (-not $ActualRegistry.EndsWith("/")) {
     $ActualRegistry += "/"
 }
+
+$TargetOS = $TargetOS -replace '\s+', ''
+$TargetCPU = $TargetCPU -replace '\s+', ''
 
 if ($Action -eq "pack") {
     Write-Info "Phase 1: Starting pack process..."
@@ -71,11 +78,6 @@ if ($Action -eq "pack") {
     if (Test-Path "openclaw-offline-windows.zip") { Remove-Item -Force "openclaw-offline-windows.zip" }
     Set-Location "openclaw"
 
-    Write-Info "Injecting configuration natively (Registry: $ActualRegistry, Concurrency: $Concurrency)..."
-    
-    $nodeScript = "const fs=require('fs');fs.writeFileSync('.npmrc',['store-dir=./.pnpm-store-local','registry=$ActualRegistry','network-concurrency=$Concurrency','fetch-retries=$Retries','fetch-retry-mintimeout=$RetryTimeout'].join(String.fromCharCode(10)));let p=JSON.parse(fs.readFileSync('package.json','utf8'));p.pnpm=p.pnpm||{};p.pnpm.supportedArchitectures={os:['current','win32','linux','darwin'],cpu:['current','x64','arm64']};p.pnpm.onlyBuiltDependencies=['@google/genai','@matrix-org/matrix-sdk-crypto-nodejs','@tloncorp/tlon-skill','baileys','esbuild','koffi','protobufjs','sharp','tree-sitter-bash','@discordjs/opus','@tloncorp/api'];fs.writeFileSync('package.json',JSON.stringify(p,null,2));"
-    node -e $nodeScript
-
     Write-Info "Packing offline pnpm using native npm..."
     npm pack pnpm@$PnpmVersion
     Assert-Success "npm pack pnpm"
@@ -87,22 +89,29 @@ if ($Action -eq "pack") {
         exit 1
     }
 
+    Write-Info "Injecting v11-compatible configuration natively (OS: $TargetOS, CPU: $TargetCPU)..."
+    $SupportedArch = "os=$TargetOS;cpu=$TargetCPU"
+    $nodeScript = "const fs=require('fs');let p=JSON.parse(fs.readFileSync('package.json','utf8'));delete p.packageManager;if(p.pnpm){delete p.pnpm.supportedArchitectures;delete p.pnpm.onlyBuiltDependencies;}fs.writeFileSync('package.json',JSON.stringify(p,null,2));fs.writeFileSync('.npmrc',['store-dir=./.pnpm-store-local','registry=$ActualRegistry','network-concurrency=$Concurrency','fetch-retries=$Retries','fetch-retry-mintimeout=$RetryTimeout','only-built-dependencies=@google/genai,@matrix-org/matrix-sdk-crypto-nodejs,@tloncorp/tlon-skill,baileys,esbuild,koffi,protobufjs,sharp,tree-sitter-bash,@discordjs/opus,@tloncorp/api','supported-architectures=$SupportedArch'].join(String.fromCharCode(10)));"
+    node -e $nodeScript
+
     Write-Info "Downloading dependencies via configured registry..."
     $env:SHARP_IGNORE_GLOBAL_LIBVIPS = "1"
     npx pnpm@$PnpmVersion install
     Assert-Success "npx pnpm install (Pack Phase)"
 
-    Write-Info "Creating zip archive..."
+    Write-Info "Creating zip archive using optimized .NET compression..."
     Remove-Item -Recurse -Force "node_modules" -ErrorAction SilentlyContinue
     Set-Location ..
-    Compress-Archive -Path "openclaw" -DestinationPath "openclaw-offline-windows.zip" -Force
+    
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $SourcePath = (Get-Item "openclaw").FullName
+    $ZipPath = Join-Path $PWD "openclaw-offline-windows.zip"
+    [System.IO.Compression.ZipFile]::CreateFromDirectory($SourcePath, $ZipPath)
     
     Write-Info "Pack completed! Zip file is ready."
 
 } elseif ($Action -eq "install") {
     Write-Info "Phase 2: Starting offline installation..."
-
-Write-Info "Phase 2: Starting offline installation..."
 
     $SkipExtraction = $false
     if (Test-Path "openclaw\package.json") {
@@ -116,8 +125,14 @@ Write-Info "Phase 2: Starting offline installation..."
 
     if (-not $SkipExtraction) {
         if (Test-Path "openclaw-offline-windows.zip") {
-            Write-Info "Extracting zip file (This might take a while, consider extracting manually next time)..."
-            Expand-Archive -Path "openclaw-offline-windows.zip" -DestinationPath "." -Force
+            Write-Info "Extracting zip file"
+            if (Test-Path "openclaw") { Remove-Item -Recurse -Force "openclaw" }
+            
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            $ZipPath = (Get-Item "openclaw-offline-windows.zip").FullName
+            $DestPath = (Get-Item ".").FullName
+            [System.IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $DestPath)
+            
             Set-Location "openclaw"
         } else {
             Write-Host "[ERROR] Cannot find 'openclaw-offline-windows.zip' or a valid 'openclaw' directory!" -ForegroundColor Red
@@ -130,15 +145,9 @@ Write-Info "Phase 2: Starting offline installation..."
         npm install -g ./pnpm-offline.tgz
         Assert-Success "npm install local pnpm"
     } else {
-        if (-not (Get-Command pnpm -ErrorAction SilentlyContinue)) {
-            Write-Host "[ERROR] 'pnpm-offline.tgz' not found and 'pnpm' is not available on this system!" -ForegroundColor Red
-            exit 1
-        }
+        Write-Host "[ERROR] 'pnpm-offline.tgz' not found!" -ForegroundColor Red
+        exit 1
     }
-
-    Write-Info "Installing offline pnpm globally using native npm..."
-    npm install -g ./pnpm-offline.tgz
-    Assert-Success "npm install local pnpm"
 
     Write-Info "Installing dependencies offline..."
     $env:SHARP_IGNORE_GLOBAL_LIBVIPS = "1"
