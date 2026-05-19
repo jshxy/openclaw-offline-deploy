@@ -10,11 +10,13 @@ param (
     [int]$Retries = 8,
 
     [Parameter(Mandatory=$false)]
-    [int]$RetryTimeout = 2000
+    [int]$RetryTimeout = 2000,
+
+    [Parameter(Mandatory=$false)]
+    [string]$Registry = "default"
 )
 
 $ErrorActionPreference = "Stop"
-# Removed hardcoded version, using it only as a fallback
 $FallbackPnpmVersion = "10.23.0"
 $utf8NoBom = New-Object System.Text.UTF8Encoding $false
 
@@ -29,13 +31,27 @@ function Assert-Success([string]$TaskName) {
     }
 }
 
+$ActualRegistry = "https://registry.npmmirror.com/"
+if ($Registry -eq "official") {
+    $ActualRegistry = "https://registry.npmjs.org/"
+} elseif ($Registry -match "^https?://") {
+    $ActualRegistry = $Registry
+} elseif ($Registry -ne "default") {
+    Write-Host "[WARNING] Invalid registry provided. Falling back to default mirror." -ForegroundColor Yellow
+}
+
+# 确保 URL 以斜杠结尾
+if (-not $ActualRegistry.EndsWith("/")) {
+    $ActualRegistry += "/"
+}
+
 if ($Action -eq "pack") {
     Write-Info "Phase 1: Starting pack process..."
     
-    # 动态获取最新 pnpm 版本
-    Write-Info "Fetching latest pnpm version from npmmirror..."
+    Write-Info "Fetching latest pnpm version from registry ($ActualRegistry)..."
     try {
-        $PnpmVersion = (Invoke-RestMethod -Uri "https://registry.npmmirror.com/pnpm/latest" -UseBasicParsing -ErrorAction Stop).version
+        $ApiUrl = "${ActualRegistry}pnpm/latest"
+        $PnpmVersion = (Invoke-RestMethod -Uri $ApiUrl -UseBasicParsing -ErrorAction Stop).version
         Write-Info "Latest pnpm version resolved to: $PnpmVersion"
     } catch {
         $PnpmVersion = $FallbackPnpmVersion
@@ -56,12 +72,12 @@ if ($Action -eq "pack") {
     if (Test-Path "openclaw-offline-windows.zip") { Remove-Item -Force "openclaw-offline-windows.zip" }
     Set-Location "openclaw"
 
-    Write-Info "Injecting configuration natively (Concurrency: $Concurrency, Retries: $Retries, Timeout: ${RetryTimeout}ms)..."
+    Write-Info "Injecting configuration natively (Registry: $ActualRegistry, Concurrency: $Concurrency)..."
     
-    $nodeScript = "const fs=require('fs');fs.writeFileSync('.npmrc',['store-dir=./.pnpm-store-local','registry=https://registry.npmmirror.com/','network-concurrency=$Concurrency','fetch-retries=$Retries','fetch-retry-mintimeout=$RetryTimeout'].join(String.fromCharCode(10)));let p=JSON.parse(fs.readFileSync('package.json','utf8'));p.pnpm=p.pnpm||{};p.pnpm.supportedArchitectures={os:['current','win32','linux','darwin'],cpu:['current','x64','arm64']};p.pnpm.onlyBuiltDependencies=['@google/genai','@matrix-org/matrix-sdk-crypto-nodejs','@tloncorp/tlon-skill','baileys','esbuild','koffi','protobufjs','sharp','tree-sitter-bash','@discordjs/opus','@tloncorp/api'];fs.writeFileSync('package.json',JSON.stringify(p,null,2));"
+    $nodeScript = "const fs=require('fs');fs.writeFileSync('.npmrc',['store-dir=./.pnpm-store-local','registry=$ActualRegistry','network-concurrency=$Concurrency','fetch-retries=$Retries','fetch-retry-mintimeout=$RetryTimeout'].join(String.fromCharCode(10)));let p=JSON.parse(fs.readFileSync('package.json','utf8'));p.pnpm=p.pnpm||{};p.pnpm.supportedArchitectures={os:['current','win32','linux','darwin'],cpu:['current','x64','arm64']};p.pnpm.onlyBuiltDependencies=['@google/genai','@matrix-org/matrix-sdk-crypto-nodejs','@tloncorp/tlon-skill','baileys','esbuild','koffi','protobufjs','sharp','tree-sitter-bash','@discordjs/opus','@tloncorp/api'];fs.writeFileSync('package.json',JSON.stringify(p,null,2));"
     node -e $nodeScript
 
-    Write-Info "Packing offline pnpm@$PnpmVersion..."
+    Write-Info "Packing offline pnpm..."
     corepack enable
     corepack pack pnpm@$PnpmVersion
     Assert-Success "Corepack Pack"
@@ -75,7 +91,7 @@ if ($Action -eq "pack") {
         exit 1
     }
 
-    Write-Info "Downloading dependencies via NPM mirror..."
+    Write-Info "Downloading dependencies via configured registry..."
     $env:SHARP_IGNORE_GLOBAL_LIBVIPS = "1"
     corepack pnpm@$PnpmVersion install
     Assert-Success "pnpm install (Pack Phase)"
