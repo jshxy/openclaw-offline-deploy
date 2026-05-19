@@ -1,0 +1,129 @@
+param (
+    [Parameter(Mandatory=$true)]
+    [ValidateSet("pack", "install")]
+    [string]$Action,
+
+    [Parameter(Mandatory=$false)]
+    [int]$Concurrency = 3,
+
+    [Parameter(Mandatory=$false)]
+    [int]$Retries = 8,
+
+    [Parameter(Mandatory=$false)]
+    [int]$RetryTimeout = 2000
+)
+
+$ErrorActionPreference = "Stop"
+# Removed hardcoded version, using it only as a fallback
+$FallbackPnpmVersion = "10.23.0"
+$utf8NoBom = New-Object System.Text.UTF8Encoding $false
+
+function Write-Info([string]$Message) {
+    Write-Host "[INFO] $Message" -ForegroundColor Cyan
+}
+
+function Assert-Success([string]$TaskName) {
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[FATAL ERROR] $TaskName failed with Exit Code $LASTEXITCODE!" -ForegroundColor Red
+        exit $LASTEXITCODE
+    }
+}
+
+if ($Action -eq "pack") {
+    Write-Info "Phase 1: Starting pack process..."
+    
+    # 动态获取最新 pnpm 版本
+    Write-Info "Fetching latest pnpm version from npmmirror..."
+    try {
+        $PnpmVersion = (Invoke-RestMethod -Uri "https://registry.npmmirror.com/pnpm/latest" -UseBasicParsing -ErrorAction Stop).version
+        Write-Info "Latest pnpm version resolved to: $PnpmVersion"
+    } catch {
+        $PnpmVersion = $FallbackPnpmVersion
+        Write-Host "[WARNING] Failed to fetch latest version, using fallback: $PnpmVersion" -ForegroundColor Yellow
+    }
+
+    if (Get-Command git -ErrorAction SilentlyContinue) {
+        if (Test-Path "openclaw") { Remove-Item -Recurse -Force "openclaw" }
+        git clone https://github.com/openclaw/openclaw.git
+        Assert-Success "Git Clone"
+    } else {
+        if (-not (Test-Path "openclaw")) {
+            Write-Host "[ERROR] Git not found and 'openclaw' directory missing!" -ForegroundColor Red
+            exit 1
+        }
+    }
+    
+    if (Test-Path "openclaw-offline-windows.zip") { Remove-Item -Force "openclaw-offline-windows.zip" }
+    Set-Location "openclaw"
+
+    Write-Info "Injecting configuration natively (Concurrency: $Concurrency, Retries: $Retries, Timeout: ${RetryTimeout}ms)..."
+    
+    $nodeScript = "const fs=require('fs');fs.writeFileSync('.npmrc',['store-dir=./.pnpm-store-local','registry=https://registry.npmmirror.com/','network-concurrency=$Concurrency','fetch-retries=$Retries','fetch-retry-mintimeout=$RetryTimeout'].join(String.fromCharCode(10)));let p=JSON.parse(fs.readFileSync('package.json','utf8'));p.pnpm=p.pnpm||{};p.pnpm.supportedArchitectures={os:['current','win32','linux','darwin'],cpu:['current','x64','arm64']};p.pnpm.onlyBuiltDependencies=['@google/genai','@matrix-org/matrix-sdk-crypto-nodejs','@tloncorp/tlon-skill','baileys','esbuild','koffi','protobufjs','sharp','tree-sitter-bash','@discordjs/opus','@tloncorp/api'];fs.writeFileSync('package.json',JSON.stringify(p,null,2));"
+    node -e $nodeScript
+
+    Write-Info "Packing offline pnpm@$PnpmVersion..."
+    corepack enable
+    corepack pack pnpm@$PnpmVersion
+    Assert-Success "Corepack Pack"
+    
+    if (Test-Path "corepack.tgz") {
+        Move-Item -Path "corepack.tgz" -Destination "pnpm-offline.tgz" -Force
+    } elseif (Test-Path "pnpm-$PnpmVersion.tgz") {
+        Move-Item -Path "pnpm-$PnpmVersion.tgz" -Destination "pnpm-offline.tgz" -Force
+    } else {
+        Write-Host "[ERROR] Corepack output file not found!" -ForegroundColor Red
+        exit 1
+    }
+
+    Write-Info "Downloading dependencies via NPM mirror..."
+    $env:SHARP_IGNORE_GLOBAL_LIBVIPS = "1"
+    corepack pnpm@$PnpmVersion install
+    Assert-Success "pnpm install (Pack Phase)"
+
+    Write-Info "Creating zip archive..."
+    Remove-Item -Recurse -Force "node_modules" -ErrorAction SilentlyContinue
+    Set-Location ..
+    Compress-Archive -Path "openclaw" -DestinationPath "openclaw-offline-windows.zip" -Force
+    
+    Write-Info "Pack completed! Zip file is ready."
+
+} elseif ($Action -eq "install") {
+    Write-Info "Phase 2: Starting offline installation..."
+
+    if (Test-Path "openclaw-offline-windows.zip") {
+        Write-Info "Extracting zip file..."
+        if (Test-Path "openclaw") { Remove-Item -Recurse -Force "openclaw" }
+        Expand-Archive -Path "openclaw-offline-windows.zip" -DestinationPath "." -Force
+        Set-Location "openclaw"
+    } elseif (Test-Path "openclaw") {
+        Set-Location "openclaw"
+    } elseif (Test-Path "pnpm-offline.tgz") {
+        Write-Info "Already in openclaw directory."
+    } else {
+        Write-Host "[ERROR] Cannot find zip file or openclaw directory!" -ForegroundColor Red
+        exit 1
+    }
+
+    Write-Info "Installing offline pnpm..."
+    corepack enable
+    corepack install -g ./pnpm-offline.tgz
+    Assert-Success "Corepack Install"
+
+    Write-Info "Installing dependencies offline..."
+    $env:SHARP_IGNORE_GLOBAL_LIBVIPS = "1"
+    pnpm install --offline
+    Assert-Success "pnpm install --offline (Install Phase)"
+
+    Write-Info "Building project..."
+    pnpm build
+    Assert-Success "pnpm build"
+    pnpm ui:build
+    Assert-Success "pnpm ui:build"
+
+    Write-Info "Linking global command..."
+    pnpm link --global
+    Assert-Success "pnpm link"
+
+    Write-Info "Install completed! Start command:"
+    Write-Host "openclaw onboard --install-daemon" -ForegroundColor Green
+}
