@@ -4,27 +4,10 @@ param (
     [string]$Action,
 
     [Parameter(Mandatory=$false)]
-    [int]$Concurrency = 3,
-
-    [Parameter(Mandatory=$false)]
-    [int]$Retries = 8,
-
-    [Parameter(Mandatory=$false)]
-    [int]$RetryTimeout = 2000,
-
-    [Parameter(Mandatory=$false)]
-    [string]$Registry = "default",
-
-    [Parameter(Mandatory=$false)]
-    [string]$TargetOS = "current,win32,linux,darwin",
-
-    [Parameter(Mandatory=$false)]
-    [string]$TargetCPU = "current,x64,arm64"
+    [string]$Registry = "https://registry.npmmirror.com/"
 )
 
 $ErrorActionPreference = "Stop"
-$FallbackPnpmVersion = "11.1.0"
-$utf8NoBom = New-Object System.Text.UTF8Encoding $false
 
 function Write-Info([string]$Message) {
     Write-Host "[INFO] $Message" -ForegroundColor Cyan
@@ -37,133 +20,257 @@ function Assert-Success([string]$TaskName) {
     }
 }
 
-$ActualRegistry = "https://registry.npmmirror.com/"
-if ($Registry -eq "official") {
-    $ActualRegistry = "https://registry.npmjs.org/"
-} elseif ($Registry -match "^https?://") {
-    $ActualRegistry = $Registry
-}
-
-if (-not $ActualRegistry.EndsWith("/")) {
-    $ActualRegistry += "/"
-}
-
-$TargetOS = $TargetOS -replace '\s+', ''
-$TargetCPU = $TargetCPU -replace '\s+', ''
+if (-not $Registry.EndsWith("/")) { $Registry += "/" }
 
 if ($Action -eq "pack") {
     Write-Info "Phase 1: Starting pack process..."
-    
-    Write-Info "Fetching latest pnpm version from registry ($ActualRegistry)..."
-    try {
-        $ApiUrl = "${ActualRegistry}pnpm/latest"
-        $PnpmVersion = (Invoke-RestMethod -Uri $ApiUrl -UseBasicParsing -ErrorAction Stop).version
-        Write-Info "Latest pnpm version resolved to: $PnpmVersion"
-    } catch {
-        $PnpmVersion = $FallbackPnpmVersion
-        Write-Host "[WARNING] Failed to fetch latest version, using fallback: $PnpmVersion" -ForegroundColor Yellow
-    }
 
-    if (Get-Command git -ErrorAction SilentlyContinue) {
-        if (Test-Path "openclaw") { Remove-Item -Recurse -Force "openclaw" }
+    if (Test-Path "openclaw\package.json") {
+        Write-Info "Found existing openclaw directory, skipping git clone."
+    } else {
+        if (Test-Path "openclaw") { Remove-Item -Recurse -Force "openclaw" -ErrorAction SilentlyContinue }
         git clone https://github.com/openclaw/openclaw.git
         Assert-Success "Git Clone"
+    }
+    
+    Set-Location "openclaw"
+
+    Write-Info "Writing .npmrc registry settings..."
+    "registry=$Registry`n" | Set-Content -Path ".npmrc" -Encoding Ascii
+
+    Write-Info "Parsing package.json and updating pnpm-workspace.yaml..."
+    
+    $migrateJs = @'
+const fs = require("fs");
+const pkgPath = "package.json";
+const yamlPath = "pnpm-workspace.yaml";
+
+let yaml = fs.existsSync(yamlPath) ? fs.readFileSync(yamlPath, "utf8") : "";
+
+const setKey = (key, val) => {
+    const re = new RegExp(`^${key}:.*$`, "m");
+    if (re.test(yaml)) {
+        yaml = yaml.replace(re, `${key}: ${val}`);
     } else {
-        if (-not (Test-Path "openclaw")) {
-            Write-Host "[ERROR] Git not found and 'openclaw' directory missing!" -ForegroundColor Red
-            exit 1
+        yaml += `\n${key}: ${val}`;
+    }
+};
+
+setKey("storeDir", "./.pnpm-store-local");
+setKey("cacheDir", "./.pnpm-cache-local");
+setKey("stateDir", "./.pnpm-state-local");
+setKey("minimumReleaseAge", "0");
+
+try {
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+    let overrides = {};
+    let has = false;
+
+    if (pkg.overrides) { Object.assign(overrides, pkg.overrides); delete pkg.overrides; has = true; }
+    if (pkg.pnpm && pkg.pnpm.overrides) { Object.assign(overrides, pkg.pnpm.overrides); delete pkg.pnpm; has = true; }
+
+    if (has && Object.keys(overrides).length > 0) {
+        if (!/^overrides:/m.test(yaml)) {
+            yaml += "\noverrides:\n";
+        }
+        for (const [k, v] of Object.entries(overrides)) {
+            const esc = k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            const re = new RegExp(`^\\s*"?(?:${esc})"?:.*$`, "m");
+            if (re.test(yaml)) {
+                yaml = yaml.replace(re, `  "${k}": "${v}"`);
+            } else {
+                yaml = yaml.replace(/^overrides:/m, `overrides:\n  "${k}": "${v}"`);
+            }
         }
     }
     
-    if (Test-Path "openclaw-offline-windows.zip") { Remove-Item -Force "openclaw-offline-windows.zip" }
-    Set-Location "openclaw"
+    pkg.devDependencies = pkg.devDependencies || {};
+    pkg.devDependencies["pnpm"] = "^11.0.0";
 
-    Write-Info "Packing offline pnpm using native npm..."
-    npm pack pnpm@$PnpmVersion
-    Assert-Success "npm pack pnpm"
+    fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2), "utf8");
+} catch (e) {
+    console.error(e.message);
+}
+
+fs.writeFileSync(yamlPath, yaml.trim() + "\n", "utf8");
+'@
+    $migrateJs | node
+
+    Write-Info "Installing dependencies and checking for build intercepts..."
     
-    if (Test-Path "pnpm-$PnpmVersion.tgz") {
-        Move-Item -Path "pnpm-$PnpmVersion.tgz" -Destination "pnpm-offline.tgz" -Force
-    } else {
-        Write-Host "[ERROR] npm pack output file not found!" -ForegroundColor Red
-        exit 1
+    $pnpmOutput = npx --yes pnpm@11 install --no-frozen-lockfile 2>&1
+    $exitCode = $LASTEXITCODE
+    $pnpmOutput | ForEach-Object { Write-Host $_ }
+    
+    if ($exitCode -ne 0) {
+        $errText = $pnpmOutput -join "`n"
+        
+        if ($errText -match "\[ERR_PNPM_IGNORED_BUILDS\]\s*Ignored build scripts:\s*([^\n]+)") {
+            $rawList = $Matches[1]
+            Write-Info "Intercepted unauthorized build scripts. Applying allowBuilds whitelist..."
+            
+            $env:PNPM_RAW_LIST = $rawList
+            $allowJs = @'
+const fs = require("fs");
+let rawList = process.env.PNPM_RAW_LIST || "";
+rawList = rawList.replace(/[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g, "");
+
+let packages = rawList.split(",").map(s => {
+    let p = s.trim();
+    let atIndex = p.lastIndexOf("@");
+    return atIndex > 0 ? p.substring(0, atIndex) : p;
+}).filter(Boolean);
+
+packages = [...new Set(packages)];
+
+if (packages.length > 0) {
+    const yamlPath = "pnpm-workspace.yaml";
+    let yaml = fs.existsSync(yamlPath) ? fs.readFileSync(yamlPath, "utf8") : "";
+    
+    if (!/^allowBuilds:/m.test(yaml)) {
+        yaml += "\nallowBuilds:\n";
+    }
+    
+    packages.forEach(pkg => {
+        const esc = pkg.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const re = new RegExp(`^\\s*"?(?:${esc})"?:.*$`, "m");
+        if (!re.test(yaml)) {
+            yaml = yaml.replace(/^allowBuilds:/m, `allowBuilds:\n  "${pkg}": true`);
+        }
+    });
+    
+    fs.writeFileSync(yamlPath, yaml.trim() + "\n", "utf8");
+}
+'@
+            $allowJs | node
+            Assert-Success "Write allowBuilds"
+            
+            Write-Info "Whitelist updated, retrying build..."
+            npx --yes pnpm@11 install --no-frozen-lockfile
+            Assert-Success "pnpm install (Retry with allowBuilds)"
+        } else {
+            Write-Host "[FATAL ERROR] Installation failed with Exit Code $exitCode!" -ForegroundColor Red
+            exit $exitCode
+        }
     }
 
-    Write-Info "Injecting v11-compatible configuration natively (OS: $TargetOS, CPU: $TargetCPU)..."
-    $SupportedArch = "os=$TargetOS;cpu=$TargetCPU"
-    $nodeScript = "const fs=require('fs');let p=JSON.parse(fs.readFileSync('package.json','utf8'));delete p.packageManager;if(p.pnpm){delete p.pnpm.supportedArchitectures;delete p.pnpm.onlyBuiltDependencies;}fs.writeFileSync('package.json',JSON.stringify(p,null,2));fs.writeFileSync('.npmrc',['store-dir=./.pnpm-store-local','registry=$ActualRegistry','network-concurrency=$Concurrency','fetch-retries=$Retries','fetch-retry-mintimeout=$RetryTimeout','only-built-dependencies=@google/genai,@matrix-org/matrix-sdk-crypto-nodejs,@tloncorp/tlon-skill,baileys,esbuild,koffi,protobufjs,sharp,tree-sitter-bash,@discordjs/opus,@tloncorp/api','supported-architectures=$SupportedArch'].join(String.fromCharCode(10)));"
-    node -e $nodeScript
+    Write-Info "Cleaning up node_modules to optimize zip size..."
+    if (Test-Path "node_modules") { Remove-Item -Recurse -Force "node_modules" -ErrorAction SilentlyContinue }
 
-    Write-Info "Downloading dependencies via configured registry..."
-    $env:SHARP_IGNORE_GLOBAL_LIBVIPS = "1"
-    npx pnpm@$PnpmVersion install
-    Assert-Success "npx pnpm install (Pack Phase)"
-
-    Write-Info "Creating zip archive using optimized .NET compression..."
-    Remove-Item -Recurse -Force "node_modules" -ErrorAction SilentlyContinue
     Set-Location ..
     
+    Write-Info "Creating offline ZIP archive..."
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $SourcePath = (Get-Item "openclaw").FullName
     $ZipPath = Join-Path $PWD "openclaw-offline-windows.zip"
-    [System.IO.Compression.ZipFile]::CreateFromDirectory($SourcePath, $ZipPath)
+    if (Test-Path $ZipPath) { Remove-Item -Force $ZipPath }
     
-    Write-Info "Pack completed! Zip file is ready."
+    [System.IO.Compression.ZipFile]::CreateFromDirectory($SourcePath, $ZipPath, [System.IO.Compression.CompressionLevel]::Optimal, $true)
+    
+    Write-Info "Pack phase completed! Output: $ZipPath"
 
 } elseif ($Action -eq "install") {
     Write-Info "Phase 2: Starting offline installation..."
 
-    $SkipExtraction = $false
     if (Test-Path "openclaw\package.json") {
-        Write-Info "Detected manually extracted 'openclaw' directory. Skipping zip extraction to save time."
-        Set-Location "openclaw"
-        $SkipExtraction = $true
-    } elseif (Test-Path "package.json") {
-        Write-Info "Already inside a valid openclaw directory. Proceeding..."
-        $SkipExtraction = $true
-    }
-
-    if (-not $SkipExtraction) {
+        Write-Info "Found existing openclaw directory, skipping ZIP extraction."
+    } else {
         if (Test-Path "openclaw-offline-windows.zip") {
-            Write-Info "Extracting zip file"
-            if (Test-Path "openclaw") { Remove-Item -Recurse -Force "openclaw" }
-            
+            Write-Info "Extracting openclaw-offline-windows.zip..."
             Add-Type -AssemblyName System.IO.Compression.FileSystem
             $ZipPath = (Get-Item "openclaw-offline-windows.zip").FullName
             $DestPath = (Get-Item ".").FullName
             [System.IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $DestPath)
-            
-            Set-Location "openclaw"
         } else {
-            Write-Host "[ERROR] Cannot find 'openclaw-offline-windows.zip' or a valid 'openclaw' directory!" -ForegroundColor Red
+            Write-Host "[FATAL ERROR] Cannot find openclaw directory or offline zip!" -ForegroundColor Red
             exit 1
         }
     }
 
-    if (Test-Path "pnpm-offline.tgz") {
-        Write-Info "Installing offline pnpm globally using native npm..."
-        npm install -g ./pnpm-offline.tgz
-        Assert-Success "npm install local pnpm"
-    } else {
-        Write-Host "[ERROR] 'pnpm-offline.tgz' not found!" -ForegroundColor Red
-        exit 1
+    Set-Location "openclaw"
+
+    Write-Info "Globally installing offline pnpm from local workspace..."
+    npm install -g pnpm --prefix="$env:APPDATA\npm" --cache="./.pnpm-store-local" --prefer-offline --no-audit
+    Assert-Success "npm install offline pnpm"
+
+    Write-Info "Executing offline dependency restoration..."
+    $env:SHARP_IGNORE_GLOBAL_LIBVIPS = "1"
+    
+    $pnpmOutput = pnpm install --offline --frozen-lockfile 2>&1
+    $exitCode = $LASTEXITCODE
+    $pnpmOutput | ForEach-Object { Write-Host $_ }
+
+    if ($exitCode -ne 0) {
+        $errText = $pnpmOutput -join "`n"
+        
+        if ($errText -match "\[ERR_PNPM_IGNORED_BUILDS\]\s*Ignored build scripts:\s*([^\n]+)") {
+            $rawList = $Matches[1]
+            Write-Info "Intercepted unauthorized build scripts during OFFLINE install. Applying allowBuilds whitelist..."
+            
+            $env:PNPM_RAW_LIST = $rawList
+            $allowJs = @'
+const fs = require("fs");
+let rawList = process.env.PNPM_RAW_LIST || "";
+rawList = rawList.replace(/[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g, "");
+
+let packages = rawList.split(",").map(s => {
+    let p = s.trim();
+    let atIndex = p.lastIndexOf("@");
+    return atIndex > 0 ? p.substring(0, atIndex) : p;
+}).filter(Boolean);
+
+packages = [...new Set(packages)];
+
+if (packages.length > 0) {
+    const yamlPath = "pnpm-workspace.yaml";
+    let yaml = fs.existsSync(yamlPath) ? fs.readFileSync(yamlPath, "utf8") : "";
+    
+    if (!/^allowBuilds:/m.test(yaml)) {
+        yaml += "\nallowBuilds:\n";
+    }
+    
+    packages.forEach(pkg => {
+        const esc = pkg.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const re = new RegExp(`^\\s*"?(?:${esc})"?:.*$`, "m");
+        if (!re.test(yaml)) {
+            yaml = yaml.replace(/^allowBuilds:/m, `allowBuilds:\n  "${pkg}": true`);
+        }
+    });
+    
+    fs.writeFileSync(yamlPath, yaml.trim() + "\n", "utf8");
+}
+'@
+            $allowJs | node
+            Assert-Success "Write allowBuilds (Offline)"
+            
+            Write-Info "Whitelist updated, retrying offline build..."
+            pnpm install --offline --frozen-lockfile
+            Assert-Success "pnpm install (Offline Retry with allowBuilds)"
+        } else {
+            Write-Host "[FATAL ERROR] Offline Installation failed
+            exit $exitCode
+        }
     }
 
-    Write-Info "Installing dependencies offline..."
-    $env:SHARP_IGNORE_GLOBAL_LIBVIPS = "1"
-    pnpm install --offline
-    Assert-Success "pnpm install --offline (Install Phase)"
-
     Write-Info "Building project..."
-    pnpm build
+    pnpm run build
     Assert-Success "pnpm build"
-    pnpm ui:build
+    pnpm run ui:build
     Assert-Success "pnpm ui:build"
 
     Write-Info "Linking global command..."
-    pnpm link --global
-    Assert-Success "pnpm link"
+    $env:PNPM_CONFIG_OFFLINE = "true"
+    
+    $linkOutput = pnpm link --global 2>&1
+    $linkExitCode = $LASTEXITCODE
+    $linkOutput | ForEach-Object { Write-Host $_ }
 
-    Write-Info "Install completed! Start command:"
+    if ($linkExitCode -ne 0) {
+        Write-Info "pnpm link failed. Falling back to npm link..."
+        npm link
+        Assert-Success "npm link fallback"
+    }
+
+    Write-Host "`n[SUCCESS] Installation complete! Start command:" -ForegroundColor Green
     Write-Host "openclaw onboard --install-daemon" -ForegroundColor Green
 }
